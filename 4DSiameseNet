@@ -1,0 +1,817 @@
+import os
+import sys
+import time
+import gc
+import numpy as np
+import random
+import glob
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import csv
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.autograd import Variable
+
+from sklearn.metrics import f1_score
+
+import scipy.ndimage
+
+from skimage import exposure
+
+from sklearn.metrics import roc_curve
+from itertools import zip_longest, chain, cycle, islice
+
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
+
+#from apex import amp
+
+torch.backends.cudnn.enabled = False
+#torch.manual_seed(10)
+#torchseed = torch.random.initial_seed()
+torchseed = 40
+torch.manual_seed(torchseed)
+print("SEED ", torchseed)
+
+
+# added by CCJ;
+def count(start=0, step=1):
+    # count(10) --> 10 11 12 13 14 ...
+    # count(2.5, 0.5) -> 2.5 3.0 3.5 ...
+    n = start
+    while True:
+        yield n
+        n += step
+
+#> see:https://gist.github.com/david-macleod/2b933d28fd3ac09766785728ee191f09
+def plot_timings(model, train_loader, val_loader, n_batches, max_time = 120):
+	print("\n\nTIMINGS")
+	fig, ax = plt.subplots()
+	ax.set_axisbelow(True)
+	ax.yaxis.grid(which="major", color='black', linewidth=1)
+
+	zero_time = time.time()
+	worker_ids = {}
+	worker_count = count() 
+	for i,result in enumerate(train_loader):
+		print(i+1)
+		imgs, imgs2, _= result[0]
+		result = result[1]
+		start = time.time()
+		_, res = model(imgs, imgs2)
+		end = time.time()
+		del imgs
+		del imgs2
+		del res
+		print("train model time ",end - start)
+		
+		# check if already batched
+		if isinstance(result[0], torch.Tensor):
+			result = zip(*result)
+		
+		batch = []
+		for item in result:
+			data, worker, t1, t2, t3, t4 = tuple(map(scalar, item))
+			# fix worker position in plot
+			if worker != -1:
+				if worker not in worker_ids:
+					worker_ids[worker] = next(worker_count)
+				worker = worker_ids[worker]
+			plot_time_box(data, worker, t1-zero_time, t2-zero_time, ax)
+			plot_time_box(data, worker, t3-zero_time, t4-zero_time, ax, color="gray")
+			batch.append(data)
+		del result
+		batch_str = ",".join(str(i+1))
+		plot_time_box(batch_str, -1, start-zero_time, end-zero_time, ax, color='firebrick')
+		print("train batch time ", t2 - t1)
+		print("train batch time ", t4 - t3)
+		
+	for j,result in enumerate(val_loader):
+		print(j+1)
+		imgs, imgs2, _ = result[0]
+		result = result[1]
+		start = time.time()
+		_, res = model(imgs, imgs2)
+		end = time.time()
+		del imgs
+		del imgs2
+		del res
+		print("val model time ",end - start)
+		
+		# check if already batched
+		if isinstance(result[0], torch.Tensor):
+			result = zip(*result)
+		
+		batch = []
+		for item in result:
+			data, worker, t1, t2, t3, t4 = tuple(map(scalar, item))
+			# fix worker position in plot
+			if worker != -1:
+				if worker not in worker_ids:
+					worker_ids[worker] = next(worker_count)
+				worker = worker_ids[worker]
+			plot_time_box(data, worker, t1-zero_time, t2-zero_time, ax, color='yellow')
+			plot_time_box(data, worker, t3-zero_time, t4-zero_time, ax, color='gray')
+			batch.append(data)
+		del result
+		batch_str = ",".join(str(j+1))
+		plot_time_box(batch_str, -1, start-zero_time, end-zero_time, ax, color='green')
+		print("val batch time ", t2 - t1)
+
+	max_worker = len(worker_ids) - 1 
+
+	ax.set_xlim(0, max_time)
+	ax.set_ylim(-1.5, max_worker + 0.5)
+	ax.set_xticks(np.arange(0, max_time, 1.))
+	ax.set_yticks(np.arange(-1, max_worker+1, 1))
+	ax.set_yticklabels([])
+	ax.tick_params(axis='y', colors=(0,0,0,0))
+
+	fig.set_figwidth(16)
+	fig.set_figheight((max_worker + 2) * 0.5)
+
+	ax.xaxis.label.set_color('gray')
+	ax.tick_params(axis='x', colors='gray')
+	for spine in ax.spines.values():
+		  spine.set_edgecolor((0,0,0,0))
+	# for showing image 
+	#plt.show()
+	plt.savefig("timings_trainval_bsize"+str(train_loader.batch_size)+"_workers"+str(train_loader.num_workers)+".png")
+		  
+def scalar(x):
+	return x.item() if hasattr(x, 'item') else x
+
+def plot_time_box(data, worker, t1, t2, ax, color='steelblue'):
+	x = t1
+	y = worker - 0.25
+	w = t2 - t1
+	h = 0.6
+
+	rect = Rectangle((x, y), w, h, linewidth=1, edgecolor='black',facecolor=color)
+
+	ax.add_patch(rect)
+
+	ax.text(x + (w * 0.5), y + (h * 0.5), str(data), va='center', ha='center', color='white', weight='normal', size='x-small')  
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels, hidden_channels, stride, kernel_size):
+        super(ConvLSTMCell, self).__init__()
+
+        #assert hidden_channels % 2 == 0 # ???
+
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.num_features = 4
+        self.stride = stride
+
+        self.padding = int((kernel_size - 1) / 2)
+
+        self.Wxi = nn.Conv3d(self.input_channels, self.hidden_channels, self.kernel_size, self.stride, self.padding, bias=True)
+        self.Whi = nn.Conv3d(self.hidden_channels, self.hidden_channels, self.kernel_size, 1, self.padding, bias=False)
+        self.Wxf = nn.Conv3d(self.input_channels, self.hidden_channels, self.kernel_size, self.stride, self.padding, bias=True)
+        self.Whf = nn.Conv3d(self.hidden_channels, self.hidden_channels, self.kernel_size, 1, self.padding, bias=False)
+        self.Wxc = nn.Conv3d(self.input_channels, self.hidden_channels, self.kernel_size, self.stride, self.padding, bias=True)
+        self.Whc = nn.Conv3d(self.hidden_channels, self.hidden_channels, self.kernel_size, 1, self.padding, bias=False)
+        self.Wxo = nn.Conv3d(self.input_channels, self.hidden_channels, self.kernel_size, self.stride, self.padding, bias=True)
+        self.Who = nn.Conv3d(self.hidden_channels, self.hidden_channels, self.kernel_size, 1, self.padding, bias=False)
+
+        self.Wci = None
+        self.Wcf = None
+        self.Wco = None
+
+    def forward(self, x, h, c):
+        """
+        print("x ",x.shape)
+        print("h ",h.shape)
+        print(self.Wxi(x).shape)
+        print(self.Whi(h).shape)
+        print(c.shape)
+        print(self.Wci.shape)
+        """
+        ci = torch.sigmoid(self.Wxi(x) + self.Whi(h) + c * self.Wci)
+        cf = torch.sigmoid(self.Wxf(x) + self.Whf(h) + c * self.Wcf)
+        cc = cf * c + ci * torch.tanh(self.Wxc(x) + self.Whc(h))
+        co = torch.sigmoid(self.Wxo(x) + self.Who(h) + cc * self.Wco)
+        ch = co * torch.tanh(cc)
+        return ch, cc
+
+    def init_hidden(self, batch_size, hidden, shape):
+        if self.Wci is None:
+            self.Wci = Variable(torch.zeros(1, hidden, shape[0], shape[1], shape[2])).cuda()
+            self.Wcf = Variable(torch.zeros(1, hidden, shape[0], shape[1], shape[2])).cuda()
+            self.Wco = Variable(torch.zeros(1, hidden, shape[0], shape[1], shape[2])).cuda()
+        else:
+            assert shape[0] == self.Wci.size()[2], 'Input Height Mismatched!'
+            assert shape[1] == self.Wci.size()[3], 'Input Width Mismatched!'
+            assert shape[2] == self.Wci.size()[4], 'Input Depth Mismatched!'
+        return (Variable(torch.zeros(batch_size, hidden, shape[0], shape[1], shape[2])).cuda(),
+                Variable(torch.zeros(batch_size, hidden, shape[0], shape[1], shape[2])).cuda())
+
+
+class ConvLSTM(nn.Module):
+    # input_channels corresponds to the first input feature map
+    # hidden state is a list of succeeding lstm layers.
+    def __init__(self, input_channels, hidden_channels, strides, kernel_size):
+        super(ConvLSTM, self).__init__()
+        self.input_channels = [input_channels] + hidden_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.strides = strides
+        self.num_layers = len(hidden_channels)
+        self._all_layers = []
+        for i in range(self.num_layers):
+            name = 'cell{}'.format(i)
+            cell = ConvLSTMCell(self.input_channels[i], self.hidden_channels[i], self.strides[i], self.kernel_size)
+            setattr(self, name, cell)
+            self._all_layers.append(cell)
+
+    def forward(self, input_):
+        internal_state = []
+        for step in range(input_.shape[1]):
+            #print("step ",step+1)
+            x = input_[:,step,:,:,:,:]
+            #print("size ", x.size())
+            for i in range(self.num_layers):
+                # all cells are initialized in the first step
+                name = 'cell{}'.format(i)
+                if step == 0:
+                    bsize, _, height, width, depth = x.size()
+                    (h, c) = getattr(self, name).init_hidden(batch_size=bsize, hidden=self.hidden_channels[i],
+                                                             shape=(height//self.strides[i], width//self.strides[i], depth//self.strides[i]))
+                    internal_state.append((h, c))
+
+                # do forward
+                (h, c) = internal_state[i]
+                #print("h ",h.shape)
+                #print("c ",c.shape)
+                x, new_c = getattr(self, name)(x, h, c)
+                internal_state[i] = (x, new_c)
+                #print("X ",x.shape)
+                #pause = input("................")
+                """
+                if (step == input_.shape[1]-1) and (i == 0):
+                    plt.figure()
+                    plt.imshow(x.cpu().detach().numpy()[0,0,:,:,25])
+                    plt.figure()
+                    plt.imshow(new_c.cpu().detach().numpy()[0,0,:,:,25])
+                    plt.show()
+                """
+        return (x, new_c)
+
+
+
+def plotExampleImage(image,title):
+	fig = plt.figure(figsize=(10,2))
+	plt.title(title)
+	cols = 3
+	rows = 1
+	volume = image.numpy().reshape(image.shape[0],image.shape[1],image.shape[2])
+	proj0 = np.mean(volume, axis=0)
+	proj1 = np.mean(volume, axis=1)
+	proj2 = np.mean(volume, axis=2)
+	ax1 = fig.add_subplot(rows, cols, 1)
+	ax1.title.set_text("axis 0")
+	plt.imshow(proj0,cmap="gray") 
+	ax2 = fig.add_subplot(rows, cols, 2)
+	ax2.title.set_text("axis 1")
+	plt.imshow(proj1,cmap="gray")
+	ax3 = fig.add_subplot(rows, cols, 3)
+	ax3.title.set_text("axis 2")
+	plt.imshow(proj2,cmap="gray")
+	
+def saveExampleImage(image, title):
+	print(title)
+	volume = image.numpy().reshape(image.shape[0],image.shape[1],image.shape[2])
+	volume = volume * 255.
+	volume = np.asarray(volume, dtype=np.uint8)
+	img0 = volume[volume.shape[0]//2,:,:]
+	img1 = volume[:,volume.shape[1]//2,:]
+	img2 = volume[:,:,volume.shape[2]//2]
+	img0 = Image.fromarray(img0)
+	img0.save(title+"_0.png")
+	img1 = Image.fromarray(img1)
+	img1.save(title+"_1.png")
+	img2 = Image.fromarray(img2)
+	img2.save(title+"_2.png")
+	print("ok")
+
+
+class MultiDataset(Dataset):
+	def __init__(self, root_dir, train, augment = False, dataset=None, list_ids=None, list_labels=None, val_size=80, fold=0, test = False, missing_data = False, inference=False):
+		self.augment = augment
+		self.missing = missing_data
+		self.test = test
+		self.inference = inference
+		start = fold * val_size
+		stop = fold * val_size + val_size
+		if (train == True) and (dataset == None):
+			self.root_dir = root_dir
+	
+			self.list_files = []
+			self.list_ids = []
+			self.list_labels = []
+			# next two lines are for undersampling strategy
+			maxlen = 1000 #nb of Decline patients
+			clen = 0 # nb of Stable patients that will be added
+			for i in range(772//4):
+				#print(i+1)
+				m06_test = glob.glob(self.root_dir+"/"+str(i)+"_fmrm06_*.pt")
+				m12_test = glob.glob(self.root_dir+"/"+str(i)+"_fmrm12_*.pt")
+				if len(m12_test) == 1:
+					mrbl_file = glob.glob(self.root_dir+"/"+str(i)+"_fmrbl_*.pt")[0]
+					mrm12_file = glob.glob(self.root_dir+"/"+str(i)+"_fmrm12_*.pt")[0]
+					label = int(mrbl_file[-4])
+					if (label == 1):
+						id_ = mrbl_file[-16:-6]
+						self.list_files.append((mrbl_file, mrm12_file, label))
+						self.list_ids.append(id_)
+						self.list_labels.append(label)
+					elif (label == 0) and (clen < maxlen):
+						id_ = mrbl_file[-16:-6]
+						#mrbl = torch.load(mrbl_file)
+						#mrm12 = torch.load(mrm12_file)
+						self.list_files.append((mrbl_file, mrm12_file, label))
+						self.list_ids.append(id_)
+						self.list_labels.append(label)
+						clen += 1
+				
+				if (len(m12_test) == 0) and (len(m06_test) == 1):
+					mrbl_file = glob.glob(self.root_dir+"/"+str(i)+"_fmrbl_*.pt")[0]
+					mrm06_file = glob.glob(self.root_dir+"/"+str(i)+"_fmrm06_*.pt")[0]
+					label = int(mrbl_file[-4])
+					if (label == 1):
+						id_ = mrbl_file[-16:-6]
+						#mrbl = torch.load(mrbl_file)
+						#mrm06 = torch.load(mrm06_file)
+						self.list_files.append((mrbl_file, mrm06_file, label))
+						self.list_ids.append(id_)
+						self.list_labels.append(label)
+					elif (label == 0) and (clen < maxlen):
+						id_ = mrbl_file[-16:-6]
+						#mrbl = torch.load(mrbl_file)
+						#mrm06 = torch.load(mrm06_file)
+						self.list_files.append((mrbl_file, mrm06_file, label))
+						self.list_ids.append(id_)
+						self.list_labels.append(label)
+						clen += 1
+			print("NB subj: ",len(self.list_ids))
+			print("STABLE ",self.list_labels.count(0))
+			print("DECLINE ",self.list_labels.count(1))
+
+			c = list(zip(self.list_files, self.list_ids, self.list_labels))
+			c = sorted(c, key=lambda tup: tup[1])
+			self.list_files, self.list_ids, self.list_labels = zip(*c)
+			c = list(zip(self.list_files, self.list_ids, self.list_labels))
+			#seed = np.random.randint(0,1024)
+			seed = torchseed
+			#print("SEED ", seed)
+			random.seed(seed)
+			#print(self.list_ids)
+			random.shuffle(c)
+			self.list_files, self.list_ids, self.list_labels = zip(*c)
+			self.dataset = self.list_files[7:]
+			self.list_ids = self.list_ids[7:]
+			self.list_labels = self.list_labels[7:]
+			self.test = self.list_files[:7]
+			self.test_ids = self.list_ids[:7]
+			self.test_labels = self.list_labels[:7]
+			#print(self.list_ids)
+			if self.list_files[0:start] == None:
+				self.data = self.list_files[stop:len(self.list_files)]
+				self.labels = self.list_labels[stop:len(self.list_labels)]
+				self.ids = self.list_ids[stop:len(self.list_ids)]
+			
+			elif self.list_files[stop:len(self.list_files)] == None:
+				self.data = self.list_files[0:start]
+				self.labels = self.list_labels[0:start]
+				self.ids = self.list_ids[0:start]
+			
+			else:
+				self.data = self.list_files[0:start] + self.list_files[stop:len(self.list_files)]
+				self.labels = self.list_labels[0:start] + self.list_labels[stop:len(self.list_labels)]
+				self.ids = self.list_ids[0:start] + self.list_ids[stop:len(self.list_ids)]
+		elif (train == True) and (dataset != None):
+			print('Using pre-shuffled dataset')
+			self.dataset = dataset
+			self.list_ids = list_ids
+			self.list_labels = list_labels
+			if self.dataset[0:start] == None:
+				self.data = self.dataset[stop:len(self.dataset)]
+				self.labels = self.list_labels[stop:len(self.list_labels)]
+				self.ids = self.list_ids[stop:len(self.list_ids)]
+			
+			elif self.dataset[stop:len(self.dataset)] == None:
+				self.data = self.dataset[0:start]
+				self.labels = self.list_labels[0:start]
+				self.ids = self.list_ids[0:start]
+			
+			else:
+				self.data = self.dataset[0:start] + self.dataset[stop:len(self.dataset)]
+				self.labels = self.list_labels[0:start] + self.list_labels[stop:len(self.list_labels)]
+				self.ids = self.list_ids[0:start] + self.list_ids[stop:len(self.list_ids)]
+		elif (train == False) and (test == False):
+			print('Using pre-shuffled dataset')
+			self.dataset = dataset
+			self.list_ids = list_ids
+			self.list_labels = list_labels
+			self.data = self.dataset[start:stop]
+			self.labels = self.list_labels[start:stop]
+			self.ids = self.list_ids[start:stop]
+		elif (train == False) and (test == True):
+			print('Using pre-shuffled dataset\tTEST DATA')
+			self.dataset = dataset
+			self.list_ids = list_ids
+			self.list_labels = list_labels
+			self.data = self.dataset[:7]
+			self.labels = self.list_labels[:7]
+			self.ids = self.list_ids[:7]
+		print("STABLE ",self.labels.count(0))
+		print("DECLINE ",self.labels.count(1))
+		
+	def __len__(self):
+		'Denotes the number of batches per epoch'
+		return len(self.data)
+		
+	def __getitem__(self, idx):
+		'Generate one batch of data'
+		start = time.time()
+		imgs_file, imgs2_file, labels = self.data[idx]
+		imgs = torch.load(imgs_file)
+		imgs = imgs.astype(np.float32) / 255.
+
+		imgs2 = torch.load(imgs2_file)
+		imgs2 = imgs2.astype(np.float32) / 255.
+
+		t1 = time.time()
+		t2 = time.time()
+		if self.augment == True: # TODO modifs
+			
+			sigma = torch.randint(low=0, high=6, size=(1,)).item()*0.1
+			
+			angle = torch.randint(low=0, high=6, size=(1,)).item()
+			angle2 = torch.randint(low=0, high=6, size=(1,)).item()
+			neg = torch.randint(0,2,(1,)).item()
+			neg2 = torch.randint(0,2,(1,)).item()
+			if neg == 1:
+				angle = - angle
+			if neg2 == 1:
+				angle2 = - angle2
+			
+			flip = torch.randint(0,5,(1,)).item()
+			
+			t = 70 # nb of time steps
+			for t in range(70):
+
+				imgs[t,:,:,:,:] = scipy.ndimage.gaussian_filter(imgs[t,0,:,:,:], sigma=sigma, mode='nearest').reshape(1,64,64,48)
+				imgs2[t,:,:,:,:] = scipy.ndimage.gaussian_filter(imgs2[t,0,:,:,:], sigma=sigma, mode='nearest').reshape(1,64,64,48)
+
+			#imgs = scipy.ndimage.interpolation.rotate(imgs, angle, axes=(2,3), reshape=False, mode='nearest')
+			#imgs2 = scipy.ndimage.interpolation.rotate(imgs2, angle2, axes=(2,3), reshape=False, mode='nearest')
+
+			if flip == 1:
+				imgs = np.flip(imgs, 2)
+				imgs2 = np.flip(imgs2, 2)
+
+			ib = torch.randint(0,3,(1,)).item()
+			ih = torch.randint(98,101,(1,)).item()
+			pb, ph = np.percentile(imgs, (ib, ih))
+			pb2, ph2 = np.percentile(imgs2, (ib, ih))
+
+			imgs = exposure.rescale_intensity(imgs, in_range=(pb, ph) ,out_range=(0.,1.)).astype(np.float32)
+			imgs2 = exposure.rescale_intensity(imgs2, in_range=(pb2, ph2) ,out_range=(0.,1.)).astype(np.float32)
+		
+		end = time.time()
+		worker = torch.utils.data.get_worker_info()
+		worker_id = worker.id if worker is not None else -1
+		
+		return [(imgs,imgs2,labels),( idx, worker_id, start, t1, t2, end)]
+		
+	def getShuffledDataset(self):
+		return self.dataset, self.list_ids, self.list_labels
+		
+	def getTestDataset(self):
+		return self.test, self.test_ids, self.test_labels
+		
+	def getClassWeights(self):
+		return self.labels.count(0)/len(self.labels),self.labels.count(1)/len(self.labels) #need to reverse the weights 
+	def getPosWeight(self):
+		return self.labels.count(0)/self.labels.count(1) #weight of positive class
+
+		
+class TDSNet(nn.Module):
+	def __init__(self):
+		super(TDSNet, self).__init__()
+		
+		self.ConvLstm = ConvLSTM(input_channels=1, hidden_channels=[2,4,8], strides=[2,2,2], kernel_size=3)
+		
+		self.Flat = torch.nn.Flatten()
+		self.D0_mri = torch.nn.Linear(8*8*8*6, 1024)
+		self.BN6_mri = torch.nn.BatchNorm1d(1024)
+		self.LR5_mri = torch.nn.LeakyReLU()
+		self.D1_mri = torch.nn.Linear(1024, 512)
+		self.BN7_mri = torch.nn.BatchNorm1d(512)
+		self.LR6_mri = torch.nn.LeakyReLU()
+		self.D2_mri = torch.nn.Linear(512, 256)
+
+		self.Drop1 = torch.nn.Dropout(0.5)
+		self.Drop2 = torch.nn.Dropout(0.5)
+		self.Out = torch.nn.Linear(256,1)
+		self.Sig = torch.nn.Sigmoid()
+		
+		
+	def forward_once(self, mri):
+		#print("mri ",mri.shape) # batch, seq, c, h, w, d
+		_, x = self.ConvLstm(mri)
+		#print(mri[0,25,0,25,:,25])
+		del mri
+		return x
+	
+	def forward(self, left_mri, right_mri):
+		l_mri = self.forward_once(left_mri)
+		r_mri = self.forward_once(right_mri)
+		diff_mri = torch.abs(torch.add(l_mri,torch.neg(r_mri)))
+		#del l_mri
+		#del r_mri
+		x = self.Flat(diff_mri)
+		#del diff_mri
+		x = self.D0_mri(x)
+		x = self.BN6_mri(x)
+		x = self.LR5_mri(x)
+		x = self.D1_mri(x)
+		#x = self.Drop1(x)
+		x = self.LR6_mri(x)
+		x = self.D2_mri(x)
+		x = self.Drop2(x)
+		out = self.Out(x)
+		del x
+		outsoft = self.Sig(out)
+		return out, outsoft, diff_mri
+
+
+
+batch_size = 12 # 12 is the optimal batch size (all workers fully occupied)
+num_classes = 2
+epochs = 30
+val_size = 30
+lr = 0.001
+wks = 4 # 4 is the optimal num workers
+
+#datapath="/media/fou/C2D48AC8D48ABDE3/LINUX/ADNI_fmri3"#"/home/fou/Desktop/ADNI_fmri2"
+datapath="/media/fou/C2D48AC8D48ABDE3/LINUX/ADNI_fmri3" #"/dev/shm/ADNI_fmri3"#"/home/fou/Desktop/ADNI_fmri2"
+
+datatrain = MultiDataset(datapath, train=True, augment=True, val_size=val_size)
+print("Nb of training data: ",len(datatrain))
+shuffled_dataset, ids, labels = datatrain.getShuffledDataset()
+test_dataset, test_ids, test_labels = datatrain.getTestDataset()
+w1, w0 = datatrain.getClassWeights()
+w = datatrain.getPosWeight()
+print(w)
+print(w0)
+print(w1)
+print("Example of test data: ")
+print(test_ids[:10])
+#print(ids)
+train_dataloader = DataLoader(datatrain, shuffle=True, num_workers=wks,batch_size=batch_size, drop_last=True,pin_memory=True)
+#
+
+dataval = MultiDataset(datapath, train = False, augment=False, dataset = shuffled_dataset, list_ids = ids, list_labels = labels, val_size=val_size)
+print("Nb of validation data: ",len(dataval))
+val_dataloader = DataLoader(dataval, shuffle=True, num_workers=wks//2,batch_size=batch_size, drop_last=True, pin_memory=True)
+"""
+tdsnet = TDSNet()
+tdsnet = torch.nn.DataParallel(tdsnet,device_ids=[0,1])
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tdsnet = tdsnet.to(device)
+plot_timings(tdsnet, train_dataloader, val_dataloader, n_batches = None, max_time = 40)
+plt.show()
+print("TIMINGS FINISHED\n\n")
+pause = input(".................")
+"""
+#pause = input("pause...")
+
+nb_folds = (len(datatrain) + len(dataval)) // val_size
+print((len(datatrain) + len(dataval)) % val_size)
+print("\nRunning training with "+str(nb_folds)+"-fold validation")
+
+
+datatest = MultiDataset(datapath, train = False, augment=False, dataset = shuffled_dataset, list_ids = ids, list_labels = labels, val_size=val_size, test= True, missing_data=False,fold=0)
+print("Nb of test data: ",len(datatest))
+test_dataloader = DataLoader(datatest, shuffle=True, num_workers=wks//2,batch_size=1, drop_last=True)
+
+
+nb_folds = 1
+for fold in range(nb_folds):
+
+	
+	# Create model
+	tdsnet = TDSNet()
+
+	tdsnet = torch.nn.DataParallel(tdsnet,device_ids=[0,1])
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	tdsnet = tdsnet.to(device)
+	ce = torch.nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([w]).to(device)) #pos_weight=torch.Tensor([w]).to(device)
+	#ce = nn.CrossEntropyLoss(weight=torch.Tensor([w0,w1]).to(device))
+	#mse = nn.MSELoss()
+	optimizer = optim.Adam(tdsnet.parameters(), lr=lr)
+
+	loss_history = []
+	valloss_history = []
+	acc_history = []
+	valacc_history = []
+	f1_history = []
+	valf1_history = [] 
+	for epoch in range(epochs): 
+		print ("Fold "+str(fold)+" Epoch "+str(epoch+1)+"/"+str(epochs))
+		start_time = time.time()  
+		total=0
+		correct=0
+		tot_train_f1 = 0
+		tot_train_loss=0
+		tdsnet.train(True)
+		for i, data in enumerate(train_dataloader):
+			if i == 0:
+				print("Batch "+str(i+1)+"/"+str(len(train_dataloader)),sep='', end='', flush=True)
+			elif i == (len(train_dataloader)-1):
+				print(">",sep='', end='\n', flush=True)
+			else:
+				print(">",sep='', end='', flush=True)
+			imgs,imgs2,label = data[0]
+			optimizer.zero_grad()
+			label = label.to(device)
+			labelled = label.data.cpu().detach().numpy()
+
+			#imgs = imgs.to(device)
+			#imgs2 = imgs2.to(device)
+			output, outsoft, _ = tdsnet(imgs, imgs2)
+
+			#pause = input(".........")
+			#torch.save(tdsnet, "fmri_net_archi_"+str(fold)+".pt")
+			#print("empty model saved")
+			#torch.onnx.export(tdsnet, (imgs, imgs2), "fmri_net_archi_"+str(fold)+".onnx")
+			#print("onnx model saved")
+			#label_oh = F.one_hot(label,2)
+			label = label.unsqueeze(1).to(torch.float)
+			ce_loss = ce(output, label)
+			#mse_loss = mse(outsoft, label_oh.to(torch.float))
+			train_loss =  ce_loss #+ mse_loss
+			proba = outsoft.cpu().detach().numpy()
+			predicted = np.array([0 if val < 0.5 else 1 for val in proba])
+
+			train_loss.backward()
+			optimizer.step()
+		
+			tot_train_loss += train_loss.item()
+			total += label.size(0)
+			correct += (predicted == labelled).sum().item()
+			tot_train_f1 += f1_score(labelled, predicted)
+		print("Trn loss "+str(tot_train_loss/float(i+1))[:5]+"\t"+"acc "+str(float(correct)/float(total))[:5]+"\t"+"f1 "+str(float(tot_train_f1)/float(i+1))[:5])
+		loss_history.append(tot_train_loss/float(i+1))
+		acc_history.append(float(correct)/float(total))
+		f1_history.append(float(tot_train_f1)/float(i+1))
+	
+		total=0
+		correct=0
+		tot_val_loss=0
+		tot_val_f1 = 0
+	
+		with torch.no_grad():
+			tdsnet.train(False)
+			true_list = np.asarray([])
+			pred_list = np.asarray([])
+			probs_list = np.asarray([])
+			for j, data in enumerate(val_dataloader):
+				if j == 0:
+					print("Batch "+str(j+1)+"/"+str(len(val_dataloader)),sep='', end='', flush=True)
+				elif j == (len(val_dataloader)-1):
+					print(">",sep='', end='\n', flush=True)
+				else:
+					print(">",sep='', end='', flush=True)
+				imgs,imgs2,label = data[0]
+				#print("true: ",label.detach().numpy())
+				label = label.to(device)
+				labelled = label.data.cpu().detach().numpy()
+				#imgs = imgs.to(device)
+				#imgs2 = imgs2.to(device)
+				output, outsoft, _ = tdsnet(imgs, imgs2)
+				#label_oh = F.one_hot(label,2)
+				label = label.unsqueeze(1).to(torch.float)
+		
+				ce_loss = ce(output, label)
+				#mse_loss = mse(outsoft, label_oh.to(torch.float))
+				val_loss =  ce_loss #+ mse_loss
+			
+				tot_val_loss += val_loss.item()
+				total += label.size(0)
+				proba = outsoft.cpu().detach().numpy()
+				predicted = np.array([0 if val < 0.5 else 1 for val in proba])
+				#print(f1_score(labelled, predicted))
+				true_list = np.append(true_list,labelled)
+				pred_list = np.append(pred_list,predicted)
+				probs_list = np.append(probs_list,proba)
+				correct += (predicted == labelled).sum().item()
+				tot_val_f1 += f1_score(labelled, predicted)
+		#print("true: ",true_list)
+		#print("pred: ",pred_list)
+		#print("probas: ",probs_list.round(3))
+		print("Val loss "+str(tot_val_loss/float(j+1))[:5]+"\t"+"acc "+str(float(correct)/float(total))[:5]+"\t"+"f1 "+str(float(tot_val_f1)/float(j+1))[:5])
+		valloss_history.append(tot_val_loss/float(j+1))
+		valacc_history.append(float(correct)/float(total))
+		valf1_history.append(float(tot_val_f1)/float(j+1))
+		
+		print("Time (s): "+str(time.time() - start_time)[:5])
+	
+		
+		
+	
+	d = [loss_history, valloss_history,acc_history,valacc_history, f1_history,valf1_history]
+	export_data = zip_longest(*d, fillvalue = '')
+	with open('fmri_all_'+str(fold)+'.csv', 'w', encoding="ISO-8859-1", newline='') as myfile:
+		  wr = csv.writer(myfile)
+		  wr.writerow(("loss", "valloss","acc","valacc", "f1","valf1"))
+		  wr.writerows(export_data)
+	myfile.close()
+	
+	#print(tdsnet.state_dict())
+	torch.save(tdsnet.state_dict(), "fmri_all_net_"+str(fold)+".pt")
+	del tdsnet
+	print("Weights saved")
+	
+########## inference
+
+	tdsnet = TDSNet()
+	tdsnet = torch.nn.DataParallel(tdsnet,device_ids=[0,1])
+	tdsnet.load_state_dict(torch.load("fmri_all_net_"+str(fold)+".pt"))
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	tdsnet = tdsnet.to(device)
+	
+	y_pred_list=[]
+	y_test_list=[]
+	y_probs_list = []
+	correct = 0
+	test_f1 = 0
+	with torch.no_grad():
+		tdsnet.train(False)
+		for k, data in enumerate(test_dataloader):
+			print(k)
+			imgs,imgs2,label = data[0]
+			label = label.to(device)
+			labelled = label.data.cpu().detach().numpy()
+			output, outsoft, _ = tdsnet(imgs, imgs2)
+			proba = outsoft.cpu().detach().numpy()
+			predicted = np.array([0 if val < 0.5 else 1 for val in proba])
+			#print(f1_score(labelled, predicted))
+			y_test_list = np.append(y_test_list,labelled)
+			y_pred_list = np.append(y_pred_list,predicted)
+			y_probs_list = np.append(y_probs_list,proba)
+	
+	print("true ",y_test_list)
+	print("pred ",y_pred_list)
+	print("probas ",y_probs_list)
+	correct = (y_pred_list == y_test_list).sum().item() / len(y_test_list)
+	test_f1 = f1_score(y_test_list, y_pred_list)
+	print("ACC ",correct)
+	print("F1 ", test_f1)
+	
+	fpr, tpr, thresh = roc_curve(y_test_list, y_probs_list, drop_intermediate = False)
+	
+	d = [fpr, tpr, thresh]
+	export_data = zip_longest(*d, fillvalue = '')
+	with open('roc_'+str(fold)+'.csv', 'w', encoding="ISO-8859-1", newline='') as myfile:
+		  wr = csv.writer(myfile)
+		  wr.writerow(("fpr", "tpr", "thresh"))
+		  wr.writerows(export_data)
+	myfile.close()
+
+	
+plt.figure()
+plt.plot(loss_history)
+plt.plot(valloss_history)
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['Train loss', 'Val loss'], loc='upper left')
+"""
+plt.figure()
+plt.plot(acc_history)
+plt.plot(valacc_history)
+plt.ylabel('Acc')
+plt.xlabel('Epoch')
+plt.legend(['Train acc','Val acc'], loc='lower left')
+plt.figure()
+plt.plot(f1_history)
+plt.plot(valf1_history)
+plt.ylabel('F1')
+plt.xlabel('Epoch')
+plt.legend(['Train F1', 'Val F1'], loc='upper left')
+"""
+
+plt.show()
+plt.savefig("loss.png")
+
+
+
+		
